@@ -1,13 +1,20 @@
+// #define USE_ETHERNET
+
 #include <Adafruit_BMP280.h>
 #include <Adafruit_SHT4x.h>
 #include <Adafruit_Sensor.h>
 #include <ArduinoOTA.h>
+#include <ArduinoJson.h>
 #include <DallasTemperature.h>
+#ifdef USE_ETHERNET
+#include <ETH.h>
+#endif
 #include <LittleFS.h>
 #include <OneWire.h>
 #include <PubSubClient.h>
 #include <RF24.h>
 #include <RF24Network.h>
+#include <RemoteDebug.h>
 #include <Wire.h>
 #include <WiFi.h>
 #include <YAMLDuino.h>
@@ -20,11 +27,18 @@
 #include <vector>
 
 #define _USE_SLEEP
+#define _DEBUG_DISCOVERY
 
 #define RADIO_CE_PIN 16
 #define RADIO_CSN_PIN 5
 #define RADIO_INT_PIN 27
 #define ONE_WIRE_PIN 4
+#define ETHERNET_CS_PIN 17
+#define ETHERNET_IRQ_PIN -1
+#define ETHERNET_RESET_PIN 33
+#define ETHERNET_SCK_PIN 14
+#define ETHERNET_MISO_PIN 25
+#define ETHERNET_MOSI_PIN 13
 
 #define OTA_PASSWORD "ota"
 
@@ -35,6 +49,7 @@ constexpr const char *CONFIG_PATH = "/config.yaml";
 // Network ID for sensors read directly from this board's local peripherals.
 constexpr uint16_t LOCAL_SENSOR_NETWORK_ID = 2000;
 constexpr uint32_t LOCAL_SENSOR_INTERVAL_MS = 2UL * 60UL * 1000UL;
+constexpr uint32_t MQTT_DISCOVERY_INTERVAL_MS = 60UL * 60UL * 1000UL;
 
 struct SensorMessage {
   uint16_t location;
@@ -58,8 +73,18 @@ struct SensorConfig {
 RF24 radio(RADIO_CE_PIN, RADIO_CSN_PIN);
 RF24Network network(radio);
 WiFiClient wifiClient;
+#ifdef USE_ETHERNET
+NetworkClient ethernetClient;
+#endif
 PubSubClient mqttClient(wifiClient);
+RemoteDebug Debug;
 uint32_t lastMqttAttempt = 0;
+uint32_t lastDiscoveryPublish = 0;
+#ifdef USE_ETHERNET
+bool ethernetInitialized = false;
+bool ethernetReady = false;
+SPIClass hspi(HSPI);
+#endif
 
 // Set by the RF24 IRQ line; only used to wake the CPU from light sleep promptly.
 volatile bool radioIrqFlag = false;
@@ -124,23 +149,23 @@ bool parseBool(const char *value, bool fallback) {
 }
 
 void loadConfig() {
-  if (!LittleFS.begin(true)) {
-    Serial.println("LittleFS mount failed, using build-flag defaults");
+  if (!LittleFS.begin(true, "/littlefs", 10, "littlefs")) {
+    Debug.println("LittleFS mount failed, using build-flag defaults");
     return;
   }
 
   File file = LittleFS.open(CONFIG_PATH, "r");
   if (!file) {
-    Serial.printf("%s not found, using build-flag defaults\n", CONFIG_PATH);
+    Debug.printf("%s not found, using build-flag defaults\n", CONFIG_PATH);
     return;
   }
 
-  Serial.printf("Loading %s\n", file);
+  Debug.printf("Loading %s\n", file.name());
 
   YAMLNode root = YAMLNode::loadStream(file);
   file.close();
   if (root.isNull()) {
-    Serial.printf("Failed to parse %s\n", CONFIG_PATH);
+    Debug.printf("Failed to parse %s\n", CONFIG_PATH);
     return;
   }
 
@@ -190,7 +215,7 @@ void loadConfig() {
     }
   }
 
-  Serial.printf("Loaded %s: %u locations\n", CONFIG_PATH, static_cast<unsigned>(sensorConfigs.size()));
+  Debug.printf("Loaded %s: %u locations\n", CONFIG_PATH, static_cast<unsigned>(sensorConfigs.size()));
 }
 
 String valueTopic(const SensorConfig &config, const char *name) {
@@ -201,51 +226,44 @@ void publishValue(const String &topic, const String &value) {
   if (mqttClient.connected()) mqttClient.publish(topic.c_str(), value.c_str(), true);
 }
 
-// Indents a compact JSON string for readable Serial logging.
 void printPrettyJson(const String &json) {
-  int indent = 0;
-  bool inString = false;
-  for (size_t i = 0; i < json.length(); i++) {
-    char c = json[i];
-    if (c == '"' && (i == 0 || json[i - 1] != '\\')) inString = !inString;
-
-    if (!inString && (c == '{' || c == '[')) {
-      Serial.println(c);
-      indent++;
-      for (int j = 0; j < indent; j++) Serial.print("  ");
-    } else if (!inString && (c == '}' || c == ']')) {
-      Serial.println();
-      indent--;
-      for (int j = 0; j < indent; j++) Serial.print("  ");
-      Serial.print(c);
-    } else if (!inString && c == ',') {
-      Serial.println(c);
-      for (int j = 0; j < indent; j++) Serial.print("  ");
-    } else if (!inString && c == ':') {
-      Serial.print(": ");
-    } else {
-      Serial.print(c);
-    }
+  JsonDocument document;
+  DeserializationError error = deserializeJson(document, json);
+  if (error) {
+    Debug.printf("JSON logging failed: %s\n", error.c_str());
+    return;
   }
-  Serial.println();
+  serializeJsonPretty(document, Debug);
+  Debug.println();
 }
 
 void publishDiscovery(const SensorConfig &config, const char *name,
                       const char *unit, const char *deviceClass) {
   String topic = String("homeassistant/sensor/") + mqttDeviceId + "/" +
                  config.id + "-" + name + "/config";
-  String payload = "{\"unique_id\":\"" + mqttDeviceId + "-" +
-                   config.id + "-" + name + "\",\"name\":\"" + config.name +
-                   "\",\"state_topic\":\"" + valueTopic(config, name) +
-                   "\",\"unit_of_measurement\":\"" + unit +
-                   "\",\"state_class\":\"measurement\",\"force_update\":true,\"device_class\":\"" +
-                   deviceClass + "\",\"device\":{\"identifiers\":\"" +
-                   mqttDeviceId + "\",\"suggested_area\":\"" + config.area +
-                   "\",\"name\":\"" + mqttDeviceName + "\"},\"availability_topic\":\"" +
-                   mqttBaseTopic + "/status\",\"payload_available\":\"ONLINE\",\"payload_not_available\":\"OFFLINE\"}";
+  JsonDocument document;
+  document["unique_id"] = mqttDeviceId + "-" + config.id + "-" + name;
+  document["name"] = config.name;
+  document["state_topic"] = valueTopic(config, name);
+  document["unit_of_measurement"] = unit;
+  document["state_class"] = "measurement";
+  document["force_update"] = true;
+  document["device_class"] = deviceClass;
+  JsonObject device = document["device"].to<JsonObject>();
+  device["identifiers"] = mqttDeviceId;
+  device["suggested_area"] = config.area;
+  device["name"] = mqttDeviceName;
+  document["availability_topic"] = mqttBaseTopic + "/status";
+  document["payload_available"] = "ONLINE";
+  document["payload_not_available"] = "OFFLINE";
 
-  Serial.printf("Discovery: %s\n", topic.c_str());
-  printPrettyJson(payload);
+  String payload;
+  serializeJson(document, payload);
+
+  Debug.printf("Discovery: %s\n", topic.c_str());
+  #ifdef DEBUG_DISCOVERY
+    printPrettyJson(payload);
+  #endif
 
   publishValue(topic, payload);
 }
@@ -265,60 +283,111 @@ void publishReading(const SensorMessage &message) {
   const SensorConfig *config = findConfig(message.location);
   if (!config || !config->enabled || !mqttClient.connected()) return;
 
-  Serial.printf("Sending %s\n", config->name);
+  Debug.printf("Sending %s\n", config->name);
 
   if (message.temperature_reading != NO_SENSOR_VALUE && hasSensor(*config, "temperature"))
   {
-    Serial.printf("   Temperature: %0.2f\n", message.temperature_reading / 1000.0f);
+    Debug.printf("   Temperature: %0.2f\n", message.temperature_reading / 1000.0f);
     publishValue(valueTopic(*config, "temperature"), String(message.temperature_reading / 1000.0f, 2));
   }
   if (message.humidity_reading != NO_SENSOR_VALUE && hasSensor(*config, "humidity"))
   {
-    Serial.printf("      Humidity: %0.2f\n", message.humidity_reading / 100.0f);
+    Debug.printf("      Humidity: %0.2f\n", message.humidity_reading / 100.0f);
     publishValue(valueTopic(*config, "humidity"), String(message.humidity_reading / 100.0f, 2));
   }
   if (message.voltage_reading != NO_SENSOR_VALUE && hasSensor(*config, "battery"))
   {
-    Serial.printf("       Battery: %0.2f\n", message.voltage_reading / 1000.0f);
+    Debug.printf("       Battery: %0.2f\n", message.voltage_reading / 1000.0f);
     publishValue(valueTopic(*config, "battery"), String(message.voltage_reading / 1000.0f, 2));
   }
   if (message.pressure_reading != NO_SENSOR_VALUE && hasSensor(*config, "pressure"))
   {
-    Serial.printf("      Pressure: %0.2f\n", message.pressure_reading / 10.0f);
+    Debug.printf("      Pressure: %0.2f\n", message.pressure_reading / 10.0f);
     publishValue(valueTopic(*config, "pressure"), String(message.pressure_reading / 10.0f, 2));
   }
   if (message.light_reading != NO_SENSOR_VALUE && hasSensor(*config, "light"))
   {
-    Serial.printf("        Light: %d\n", message.light_reading);
+    Debug.printf("        Light: %d\n", message.light_reading);
     publishValue(valueTopic(*config, "light"), String(message.light_reading));
   }
-  Serial.println();
+  Debug.println();
 }
 
 void connectWifi() {
+#ifdef USE_ETHERNET
+  if (ETH.linkUp()) return;
+  if (ethernetInitialized) return;
+
+  Debug.println("Connecting to Ethernet");
+// 1. Force both Chip Selects HIGH so neither chip interferes on startup
+  pinMode(ETHERNET_CS_PIN, OUTPUT);
+  digitalWrite(ETHERNET_CS_PIN, HIGH);
+  
+  pinMode(RADIO_CSN_PIN, OUTPUT);
+  digitalWrite(RADIO_CSN_PIN, HIGH); 
+
+  // 2. Hardware Reset W5500
+  pinMode(ETHERNET_RESET_PIN, OUTPUT);
+  digitalWrite(ETHERNET_RESET_PIN, LOW);
+  delay(100);
+  digitalWrite(ETHERNET_RESET_PIN, HIGH);
+  delay(200);
+
+  // 3. Explicitly initialize HSPI with custom pins FIRST
+  if(!hspi.begin(ETHERNET_SCK_PIN, ETHERNET_MISO_PIN, ETHERNET_MOSI_PIN, ETHERNET_CS_PIN))
+  {
+    Debug.println("Initalise HSPI Failed");
+    return;
+  }
+
+  ethernetInitialized = true;
+  if (!ETH.begin(ETH_PHY_W5500, 1, ETHERNET_CS_PIN, ETHERNET_IRQ_PIN,
+                 ETHERNET_RESET_PIN, SPI2_HOST, ETHERNET_SCK_PIN,
+                 ETHERNET_MISO_PIN, ETHERNET_MOSI_PIN, 14)) {
+    Debug.println("Ethernet initialization failed");
+    return;
+  }
+  ETH.setHostname(hostName.isEmpty() ? "sensor-net" : hostName.c_str());
+  while (!ETH.linkUp()) delay(250);
+  mqttClient.setClient(ethernetClient);
+  ethernetReady = true;
+  Debug.begin(hostName.isEmpty() ? "sensor-net" : hostName);
+  Debug.setSerialEnabled(true);
+  Debug.println("Connected to Ethernet");
+  Debug.printf("IP Address is: %s\n", ETH.localIP().toString());
+  if (!hostName.isEmpty()) MDNS.begin(hostName.c_str());
+  return;
+#else
 
   if (WiFi.status() == WL_CONNECTED || wifiSsid.isEmpty()) return;
-  Serial.println("Connecting to Wifi");
+  Debug.println("Connecting to Wifi");
 
   WiFi.mode(WIFI_STA);
   if(!hostName.isEmpty()) 
   {
-    Serial.printf("Setting hostname to %s\n", hostName);
+    Debug.printf("Setting hostname to %s\n", hostName);
     WiFi.setHostname(hostName.c_str());
   }
   WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
   while (WiFi.status() != WL_CONNECTED) delay(250);
-  Serial.println("Connected to Wifi");
-  Serial.printf("IP Address is: %s\n", WiFi.localIP().toString());
+  Debug.println("Connected to Wifi");
+  Debug.begin(hostName.isEmpty() ? "sensor-net" : hostName);
+  Debug.setSerialEnabled(true);
+  Debug.printf("Connected to Wifi\n");
+  Debug.printf("IP Address is: %s\n", WiFi.localIP().toString());
   if(!hostName.isEmpty()) 
   {
     MDNS.begin(hostName.c_str());
   }
+#endif
 }
 
 void connectMqtt() {
+#ifdef USE_ETHERNET
+  if (!ethernetReady) return;
+#endif
   if (mqttClient.connected() || millis() - lastMqttAttempt < 5000) return;
-  Serial.println("Connecting to MQTT");
+  Debug.println("Connecting to MQTT");
 
   lastMqttAttempt = millis();
   String statusTopic = mqttBaseTopic + "/status";
@@ -327,31 +396,32 @@ void connectMqtt() {
       : mqttClient.connect(mqttDeviceId.c_str(), mqttUsername.c_str(), mqttPassword.c_str(),
                            statusTopic.c_str(), 1, true, "OFFLINE");
   if (connected) {
-    Serial.println("Connected to MQTT");
+    Debug.println("Connected to MQTT");
     publishValue(statusTopic, "ONLINE");
     publishDiscovery();
+    lastDiscoveryPublish = millis();
   }else {
-    Serial.println("Not Connected to MQTT");
+    Debug.println("Not Connected to MQTT");
 
   }
 }
 
 void setupOTA() {
-  Serial.println("Setting up OTA.");
+  Debug.println("Setting up OTA.");
   ArduinoOTA.setHostname(mqttDeviceId.c_str());
   if (strlen(OTA_PASSWORD) > 0) ArduinoOTA.setPassword(OTA_PASSWORD);
-  ArduinoOTA.onStart([]() { Serial.println("OTA update starting"); });
-  ArduinoOTA.onEnd([]() { Serial.println("OTA update complete"); });
-  ArduinoOTA.onError([](ota_error_t error) { Serial.printf("OTA error: %u\n", error); });
+  ArduinoOTA.onStart([]() { Debug.println("OTA update starting"); });
+  ArduinoOTA.onEnd([]() { Debug.println("OTA update complete"); });
+  ArduinoOTA.onError([](ota_error_t error) { Debug.printf("OTA error: %u\n", error); });
   ArduinoOTA.begin();
 }
 
 void setupRadio() {
   if (!radio.begin()) {
-    Serial.println("RF24 chip not detected");
+    Debug.println("RF24 chip not detected");
     while (true) delay(1000);
   }
-  Serial.println("RF25 chip detected, setting up radio network.");
+  Debug.println("RF25 chip detected, setting up radio network.");
   network.begin(radioChannel, radioNode);
   radio.setDataRate(RF24_250KBPS);
   radio.setPALevel(RF24_PA_MAX);
@@ -376,10 +446,12 @@ void setupPowerSaving() {
   pmConfig.min_freq_mhz = 80;
   pmConfig.light_sleep_enable = true;
   if (esp_pm_configure(&pmConfig) != ESP_OK) {
-    Serial.println("Failed to enable automatic light sleep");
+    Debug.println("Failed to enable automatic light sleep");
   }
 
+#ifndef USE_ETHERNET
   WiFi.setSleep(true);
+#endif
   #endif
 }
 
@@ -403,14 +475,14 @@ void setupLocalSensors() {
 
   dallasSensors.begin();
   dallasReady = dallasSensors.getDeviceCount() > 0;
-  Serial.println(dallasReady ? "DS18B20 detected" : "DS18B20 not detected");
+  Debug.println(dallasReady ? "DS18B20 detected" : "DS18B20 not detected");
 
   sht4Ready = sht4.begin(&Wire);
   if (sht4Ready) {
     sht4.setPrecision(SHT4X_HIGH_PRECISION);
     sht4.setHeater(SHT4X_NO_HEATER);
   }
-  Serial.println(sht4Ready ? "SHT4x detected" : "SHT4x not detected");
+  Debug.println(sht4Ready ? "SHT4x detected" : "SHT4x not detected");
 
   bmp280Ready = bmp280.begin(BMP280_ADDRESS_ALT) || bmp280.begin(BMP280_ADDRESS);
   if (bmp280Ready) {
@@ -418,7 +490,7 @@ void setupLocalSensors() {
                        Adafruit_BMP280::SAMPLING_X16, Adafruit_BMP280::FILTER_X16,
                        Adafruit_BMP280::STANDBY_MS_500);
   }
-  Serial.println(bmp280Ready ? "BMP280 detected" : "BMP280 not detected");
+  Debug.println(bmp280Ready ? "BMP280 detected" : "BMP280 not detected");
 }
 
 void readLocalSensors() {
@@ -453,7 +525,8 @@ void readLocalSensors() {
 void setup() {
   Serial.begin(115200);
   delayMicroseconds(3000);
-  Serial.println("Starting!...");
+  Debug.setSerialEnabled(true);
+  Debug.println("Starting!");
   loadConfig();
   connectWifi();
   setupOTA();
@@ -466,9 +539,14 @@ void setup() {
 void loop() {
   radioIrqFlag = false;
   connectWifi();
+  Debug.handle();
   ArduinoOTA.handle();
   connectMqtt();
   mqttClient.loop();
+  if (mqttClient.connected() && millis() - lastDiscoveryPublish >= MQTT_DISCOVERY_INTERVAL_MS) {
+    publishDiscovery();
+    lastDiscoveryPublish = millis();
+  }
   processRadio();
 
   if (localSensorsInitialRead || millis() - lastLocalReadMillis >= LOCAL_SENSOR_INTERVAL_MS) {
