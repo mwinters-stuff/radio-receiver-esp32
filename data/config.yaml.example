@@ -22,3 +22,12 @@ locations:
     sensors:
         - temperature
         - battery
+  - network_id: 2000
+    id: office
+    enabled: true
+    name: Office
+    area: Office
+    sensors:
+        - temperature
+        - humidity
+        - pressure
