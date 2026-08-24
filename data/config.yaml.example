@@ -1,0 +1,24 @@
+wifi:
+  ssid: YOUR_WIFI_SSID
+  password: YOUR_WIFI_PASSWORD
+  hostname: sensor-net
+radio:
+  channel: 0x47
+  node: 0
+mqtt:
+  enabled: true
+  host: mqtt://YOUR_MQTT_HOST:1883
+  username: YOUR_MQTT_USERNAME
+  password: YOUR_MQTT_PASSWORD
+  base_topic: sensor-net
+  device_id: sensor-net
+  device_name_prefix: Sensor Net
+locations:
+  - network_id: 1002
+    id: lounge
+    enabled: true
+    name: Lounge
+    area: Lounge
+    sensors:
+        - temperature
+        - battery

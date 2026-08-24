@@ -223,7 +223,9 @@ String valueTopic(const SensorConfig &config, const char *name) {
 }
 
 void publishValue(const String &topic, const String &value) {
-  if (mqttClient.connected()) mqttClient.publish(topic.c_str(), value.c_str(), true);
+  if (!mqttClient.connected()) return;
+  if (!mqttClient.publish(topic.c_str(), value.c_str(), true))
+    Debug.printf("MQTT publish failed (%u bytes): %s\n", static_cast<unsigned>(value.length()), topic.c_str());
 }
 
 void printPrettyJson(const String &json) {
@@ -271,7 +273,7 @@ void publishDiscovery(const SensorConfig &config, const char *name,
 void publishDiscovery() {
   for (const SensorConfig &config : sensorConfigs) {
     if (!config.enabled) continue;
-    if (hasSensor(config, "temperature")) publishDiscovery(config, "temperature", "C", "temperature");
+    if (hasSensor(config, "temperature")) publishDiscovery(config, "temperature", "°C", "temperature");
     if (hasSensor(config, "humidity")) publishDiscovery(config, "humidity", "%", "humidity");
     if (hasSensor(config, "battery")) publishDiscovery(config, "battery", "V", "voltage");
     if (hasSensor(config, "pressure")) publishDiscovery(config, "pressure", "hPa", "pressure");
@@ -526,10 +528,12 @@ void setup() {
   Serial.begin(115200);
   delayMicroseconds(3000);
   Debug.setSerialEnabled(true);
+  Debug.setResetCmdEnabled(true);
   Debug.println("Starting!");
   loadConfig();
   connectWifi();
   setupOTA();
+  mqttClient.setBufferSize(1024); // HA discovery payloads exceed the 256-byte default
   mqttClient.setServer(mqttHost.c_str(), mqttPort);
   setupRadio();
   setupLocalSensors();
