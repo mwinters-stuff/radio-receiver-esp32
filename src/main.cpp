@@ -1,4 +1,4 @@
-// #define USE_ETHERNET
+//#define USE_ETHERNET
 
 #include <Adafruit_BMP280.h>
 #include <Adafruit_SHT4x.h>
@@ -32,6 +32,7 @@
 #define RADIO_CE_PIN 16
 #define RADIO_CSN_PIN 5
 #define RADIO_INT_PIN 27
+#define INTERNAL_LED_PIN 2
 #define ONE_WIRE_PIN 4
 #define ETHERNET_CS_PIN 17
 #define ETHERNET_IRQ_PIN -1
@@ -114,6 +115,10 @@ String mqttPassword;
 String mqttBaseTopic = "sensor-net";
 String mqttDeviceId = "sensor-net";
 String mqttDeviceName = "Sensor Net";
+
+void setInternalLed(bool on) {
+  digitalWrite(INTERNAL_LED_PIN, on ? HIGH : LOW);
+}
 
 const SensorConfig *findConfig(uint16_t networkId) {
   for (const SensorConfig &config : sensorConfigs) {
@@ -286,6 +291,7 @@ void publishReading(const SensorMessage &message) {
   if (!config || !config->enabled || !mqttClient.connected()) return;
 
   Debug.printf("Sending %s\n", config->name);
+  setInternalLed(true);
 
   if (message.temperature_reading != NO_SENSOR_VALUE && hasSensor(*config, "temperature"))
   {
@@ -313,6 +319,7 @@ void publishReading(const SensorMessage &message) {
     publishValue(valueTopic(*config, "light"), String(message.light_reading));
   }
   Debug.println();
+  setInternalLed(false);
 }
 
 void connectWifi() {
@@ -421,6 +428,7 @@ void setupOTA() {
 void setupRadio() {
   if (!radio.begin()) {
     Debug.println("RF24 chip not detected");
+    setInternalLed(true);
     while (true) delay(1000);
   }
   Debug.println("RF25 chip detected, setting up radio network.");
@@ -525,6 +533,9 @@ void readLocalSensors() {
 }
 
 void setup() {
+  pinMode(INTERNAL_LED_PIN, OUTPUT);
+  setInternalLed(false);
+
   Serial.begin(115200);
   delayMicroseconds(3000);
   Debug.setSerialEnabled(true);
