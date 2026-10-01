@@ -1,4 +1,4 @@
-//#define USE_ETHERNET
+#define USE_ETHERNET
 
 #include <Adafruit_BMP280.h>
 #include <Adafruit_SHT4x.h>
@@ -84,7 +84,6 @@ uint32_t lastDiscoveryPublish = 0;
 #ifdef USE_ETHERNET
 bool ethernetInitialized = false;
 bool ethernetReady = false;
-SPIClass hspi(HSPI);
 #endif
 
 // Set by the RF24 IRQ line; only used to wake the CPU from light sleep promptly.
@@ -324,8 +323,27 @@ void publishReading(const SensorMessage &message) {
 
 void connectWifi() {
 #ifdef USE_ETHERNET
-  if (ETH.linkUp()) return;
-  if (ethernetInitialized) return;
+  if (ethernetReady) return;
+  if (ethernetInitialized) {
+    if (!ETH.hasIP()) {
+      static unsigned long lastStatusLog = 0;
+      if (millis() - lastStatusLog > 5000) {
+        lastStatusLog = millis();
+        Serial.println(ETH.linkUp() ? "Ethernet link up, waiting for DHCP"
+                                    : "Ethernet link down, waiting");
+      }
+      return;
+    }
+    mqttClient.setClient(ethernetClient);
+    ethernetReady = true;
+    Debug.begin(hostName.isEmpty() ? "sensor-net" : hostName);
+    Debug.setSerialEnabled(true);
+    Debug.println("Connected to Ethernet");
+    Debug.printf("IP Address is: %s\n", ETH.localIP().toString().c_str());
+    if (!hostName.isEmpty())
+      MDNS.begin(hostName.c_str());
+    return;
+  }
 
   Debug.println("Connecting to Ethernet");
 // 1. Force both Chip Selects HIGH so neither chip interferes on startup
@@ -342,14 +360,23 @@ void connectWifi() {
   digitalWrite(ETHERNET_RESET_PIN, HIGH);
   delay(200);
 
-  // 3. Explicitly initialize HSPI with custom pins FIRST
-  if(!hspi.begin(ETHERNET_SCK_PIN, ETHERNET_MISO_PIN, ETHERNET_MOSI_PIN, ETHERNET_CS_PIN))
-  {
-    Debug.println("Initalise HSPI Failed");
-    return;
-  }
+  // ETH.begin with SPI2_HOST initialises the bus itself; don't also claim it via SPIClass.
+  Debug.println("SPI Pins: ");
+  Debug.printf("  CS: %d IRQ %d RESET %d SCK %d MISO %d MOSI %d\n", ETHERNET_CS_PIN, ETHERNET_IRQ_PIN,
+                 ETHERNET_RESET_PIN, ETHERNET_SCK_PIN,
+                 ETHERNET_MISO_PIN, ETHERNET_MOSI_PIN);
 
   ethernetInitialized = true;
+  Network.onEvent([](arduino_event_id_t event, arduino_event_info_t) {
+    switch (event) {
+      case ARDUINO_EVENT_ETH_START: Serial.println("ETH event: started"); break;
+      case ARDUINO_EVENT_ETH_CONNECTED: Serial.println("ETH event: link up"); break;
+      case ARDUINO_EVENT_ETH_DISCONNECTED: Serial.println("ETH event: link down"); break;
+      case ARDUINO_EVENT_ETH_GOT_IP: Serial.println("ETH event: got IP"); break;
+      case ARDUINO_EVENT_ETH_STOP: Serial.println("ETH event: stopped"); break;
+      default: break;
+    }
+  });
   if (!ETH.begin(ETH_PHY_W5500, 1, ETHERNET_CS_PIN, ETHERNET_IRQ_PIN,
                  ETHERNET_RESET_PIN, SPI2_HOST, ETHERNET_SCK_PIN,
                  ETHERNET_MISO_PIN, ETHERNET_MOSI_PIN, 14)) {
@@ -357,14 +384,6 @@ void connectWifi() {
     return;
   }
   ETH.setHostname(hostName.isEmpty() ? "sensor-net" : hostName.c_str());
-  while (!ETH.linkUp()) delay(250);
-  mqttClient.setClient(ethernetClient);
-  ethernetReady = true;
-  Debug.begin(hostName.isEmpty() ? "sensor-net" : hostName);
-  Debug.setSerialEnabled(true);
-  Debug.println("Connected to Ethernet");
-  Debug.printf("IP Address is: %s\n", ETH.localIP().toString());
-  if (!hostName.isEmpty()) MDNS.begin(hostName.c_str());
   return;
 #else
 
@@ -429,19 +448,20 @@ void setupRadio() {
   if (!radio.begin()) {
     Debug.println("RF24 chip not detected");
     setInternalLed(true);
-    while (true) delay(1000);
-  }
-  Debug.println("RF25 chip detected, setting up radio network.");
-  network.begin(radioChannel, radioNode);
-  radio.setDataRate(RF24_250KBPS);
-  radio.setPALevel(RF24_PA_MAX);
-  radio.setRetries(15, 15);
-  radio.setAutoAck(true);
+    // while (true) delay(1000);
+  }else{
+    Debug.println("RF25 chip detected, setting up radio network.");
+    network.begin(radioChannel, radioNode);
+    radio.setDataRate(RF24_250KBPS);
+    radio.setPALevel(RF24_PA_MAX);
+    radio.setRetries(15, 15);
+    radio.setAutoAck(true);
 
-  // RF24 IRQ is active-low, open-drain; only wake on RX_DR (data ready).
-  pinMode(RADIO_INT_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(RADIO_INT_PIN), onRadioIrq, FALLING);
-  radio.maskIRQ(true, true, false);
+    // RF24 IRQ is active-low, open-drain; only wake on RX_DR (data ready).
+    pinMode(RADIO_INT_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(RADIO_INT_PIN), onRadioIrq, FALLING);
+    radio.maskIRQ(true, true, false);
+  }
 }
 
 // Lets the CPU (and Wi-Fi modem) automatically light-sleep whenever idle,
