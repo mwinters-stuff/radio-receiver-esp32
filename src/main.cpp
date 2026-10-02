@@ -526,6 +526,11 @@ void setupLocalSensors() {
 void readLocalSensors() {
   SensorMessage message{};
   message.location = LOCAL_SENSOR_NETWORK_ID;
+  message.temperature_reading = NO_SENSOR_VALUE;
+  message.humidity_reading = NO_SENSOR_VALUE;
+  message.voltage_reading = NO_SENSOR_VALUE;
+  message.pressure_reading = NO_SENSOR_VALUE;
+  message.light_reading = NO_SENSOR_VALUE;
 
   if (dallasReady) {
     dallasSensors.requestTemperatures();
