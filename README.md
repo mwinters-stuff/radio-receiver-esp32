@@ -162,3 +162,17 @@ Serial output is available at 115200 baud. The same log stream is also
 available over telnet via RemoteDebug once the device is on the network
 (default port 23) — connect with `telnet <hostname>.local` and set the log
 level with `v`/`vv`/etc.
+
+With Ethernet enabled, a cable disconnect stops the MQTT socket and the firmware
+waits for the link to return. If the link is up but DHCP has not supplied an
+address after 30 seconds, it restarts DHCP. If there is still no address after
+another 30 seconds, it tears down and reinitializes the W5500 interface. This
+recovery repeats until DHCP succeeds; initialization failures retry every
+5 seconds. Recovery actions are logged to serial, and MQTT reconnects once an
+IP address is available. No DHCP timeout runs while the cable/link is down.
+
+To check recovery on hardware, unplug/replug Ethernet and confirm `ETH event:
+got IP`, `Connected to Ethernet`, and `Connected to MQTT` return. With DHCP
+temporarily unavailable but the link still up, confirm the DHCP restart and
+W5500 restart messages appear at the intervals above, then restore DHCP and
+check that publishing resumes without rebooting the ESP32.

@@ -84,6 +84,8 @@ uint32_t lastDiscoveryPublish = 0;
 #ifdef USE_ETHERNET
 bool ethernetInitialized = false;
 bool ethernetReady = false;
+constexpr uint32_t ETHERNET_DHCP_TIMEOUT_MS = 30000;
+constexpr uint32_t ETHERNET_INIT_RETRY_MS = 5000;
 #endif
 
 // Set by the RF24 IRQ line; only used to wake the CPU from light sleep promptly.
@@ -323,17 +325,57 @@ void publishReading(const SensorMessage &message) {
 
 void connectWifi() {
 #ifdef USE_ETHERNET
-  if (ethernetReady) return;
+  static bool waitingForDhcp = false;
+  static bool dhcpRestarted = false;
+  static uint32_t dhcpWaitStarted = 0;
+  static bool initializationAttempted = false;
+  static uint32_t lastInitAttempt = 0;
+
+  if (ethernetReady) {
+    if (ETH.linkUp() && ETH.hasIP()) return;
+    ethernetReady = false;
+    ethernetClient.stop();
+    Serial.println("Ethernet connection lost; waiting for link and DHCP recovery");
+  }
   if (ethernetInitialized) {
-    if (!ETH.hasIP()) {
+    const bool linkUp = ETH.linkUp();
+    if (!linkUp || !ETH.hasIP()) {
+      if (!linkUp) {
+        waitingForDhcp = false;
+        dhcpRestarted = false;
+      } else if (!waitingForDhcp) {
+        waitingForDhcp = true;
+        dhcpWaitStarted = millis();
+      } else if (millis() - dhcpWaitStarted >= ETHERNET_DHCP_TIMEOUT_MS) {
+        dhcpWaitStarted = millis();
+        if (!dhcpRestarted) {
+          Serial.println("Ethernet DHCP timed out; restarting DHCP");
+          dhcpRestarted = true;
+          // An all-zero configuration stops DHCP, clears the old IP and starts DHCP again.
+          if (!ETH.config(IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0),
+                          IPAddress(0, 0, 0, 0))) {
+            Serial.println("Ethernet DHCP restart failed; will restart interface after timeout");
+          }
+        } else {
+          Serial.println("Ethernet DHCP still unavailable; restarting W5500 interface");
+          ethernetClient.stop();
+          ETH.end();
+          ethernetInitialized = false;
+          waitingForDhcp = false;
+          dhcpRestarted = false;
+        }
+        return;
+      }
       static unsigned long lastStatusLog = 0;
       if (millis() - lastStatusLog > 5000) {
         lastStatusLog = millis();
-        Serial.println(ETH.linkUp() ? "Ethernet link up, waiting for DHCP"
-                                    : "Ethernet link down, waiting");
+        Serial.println(linkUp ? "Ethernet link up, waiting for DHCP"
+                              : "Ethernet link down, waiting");
       }
       return;
     }
+    waitingForDhcp = false;
+    dhcpRestarted = false;
     mqttClient.setClient(ethernetClient);
     ethernetReady = true;
     Debug.begin(hostName.isEmpty() ? "sensor-net" : hostName);
@@ -344,6 +386,9 @@ void connectWifi() {
       MDNS.begin(hostName.c_str());
     return;
   }
+
+  if (initializationAttempted && millis() - lastInitAttempt < ETHERNET_INIT_RETRY_MS) return;
+  initializationAttempted = true;
 
   Debug.println("Connecting to Ethernet");
 // 1. Force both Chip Selects HIGH so neither chip interferes on startup
@@ -366,24 +411,33 @@ void connectWifi() {
                  ETHERNET_RESET_PIN, ETHERNET_SCK_PIN,
                  ETHERNET_MISO_PIN, ETHERNET_MOSI_PIN);
 
-  ethernetInitialized = true;
-  Network.onEvent([](arduino_event_id_t event, arduino_event_info_t) {
-    switch (event) {
-      case ARDUINO_EVENT_ETH_START: Serial.println("ETH event: started"); break;
-      case ARDUINO_EVENT_ETH_CONNECTED: Serial.println("ETH event: link up"); break;
-      case ARDUINO_EVENT_ETH_DISCONNECTED: Serial.println("ETH event: link down"); break;
-      case ARDUINO_EVENT_ETH_GOT_IP: Serial.println("ETH event: got IP"); break;
-      case ARDUINO_EVENT_ETH_STOP: Serial.println("ETH event: stopped"); break;
-      default: break;
-    }
-  });
+  static bool eventsRegistered = false;
+  if (!eventsRegistered) {
+    Network.onEvent([](arduino_event_id_t event, arduino_event_info_t) {
+      switch (event) {
+        case ARDUINO_EVENT_ETH_START: Serial.println("ETH event: started"); break;
+        case ARDUINO_EVENT_ETH_CONNECTED: Serial.println("ETH event: link up"); break;
+        case ARDUINO_EVENT_ETH_DISCONNECTED: Serial.println("ETH event: link down"); break;
+        case ARDUINO_EVENT_ETH_GOT_IP: Serial.println("ETH event: got IP"); break;
+        case ARDUINO_EVENT_ETH_LOST_IP: Serial.println("ETH event: lost IP"); break;
+        case ARDUINO_EVENT_ETH_STOP: Serial.println("ETH event: stopped"); break;
+        default: break;
+      }
+    });
+    eventsRegistered = true;
+  }
   if (!ETH.begin(ETH_PHY_W5500, 1, ETHERNET_CS_PIN, ETHERNET_IRQ_PIN,
                  ETHERNET_RESET_PIN, SPI2_HOST, ETHERNET_SCK_PIN,
                  ETHERNET_MISO_PIN, ETHERNET_MOSI_PIN, 14)) {
-    Debug.println("Ethernet initialization failed");
+    Serial.println("Ethernet initialization failed; retrying in 5 seconds");
+    ETH.end();
+    lastInitAttempt = millis();
     return;
   }
-  ETH.setHostname(hostName.isEmpty() ? "sensor-net" : hostName.c_str());
+  ethernetInitialized = true;
+  lastInitAttempt = millis();
+  if (!ETH.setHostname(hostName.isEmpty() ? "sensor-net" : hostName.c_str()))
+    Serial.println("Failed to set Ethernet hostname");
   return;
 #else
 
@@ -429,7 +483,7 @@ void connectMqtt() {
     publishDiscovery();
     lastDiscoveryPublish = millis();
   }else {
-    Debug.println("Not Connected to MQTT");
+    Debug.printf("MQTT connection failed, state: %d\n", mqttClient.state());
 
   }
 }
